@@ -499,6 +499,10 @@ func (s *Server) apiGetAutoDJ(w http.ResponseWriter, r *http.Request) {
 		SongCommandTimeout   int                  `json:"song_command_timeout"`
 		OnPlayCommand        string               `json:"on_play_command"`
 		OnPlayCommandTimeout int                  `json:"on_play_command_timeout"`
+		Source               string               `json:"source"`
+		NeteasePlaylists     []int64              `json:"netease_playlists"`
+		IdleSkip             bool                 `json:"idle_skip"`
+		AutoCachePlaylist    bool                 `json:"auto_cache_playlist"`
 		Queue                []relay.PlaylistItem `json:"queue"`
 	}
 
@@ -532,6 +536,13 @@ func (s *Server) apiGetAutoDJ(w http.ResponseWriter, r *http.Request) {
 			Loop:                 adj.Loop,
 			InjectMetadata:       adj.InjectMetadata,
 			Visible:              adj.Visible,
+			Source:               config.NormalizeAutoDJSource(adj.Source),
+			NeteasePlaylists:     append([]int64(nil), adj.NeteasePlaylists...),
+			IdleSkip:             adj.IdleSkip,
+			AutoCachePlaylist:    adj.AutoCachePlaylist,
+		}
+		if info.NeteasePlaylists == nil {
+			info.NeteasePlaylists = []int64{}
 		}
 		if st, ok := streamerMap[adj.Mount]; ok {
 			stats := st.GetStats()
@@ -581,21 +592,25 @@ func (s *Server) apiCreateAutoDJ(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body struct {
-		Name                 string `json:"name"`
-		Mount                string `json:"mount"`
-		MusicDir             string `json:"music_dir"`
-		Format               string `json:"format"`
-		Bitrate              int    `json:"bitrate"`
-		Loop                 bool   `json:"loop"`
-		InjectMetadata       bool   `json:"inject_metadata"`
-		MPDEnabled           bool   `json:"mpd_enabled"`
-		MPDPort              string `json:"mpd_port"`
-		MPDPassword          string `json:"mpd_password"`
-		Visible              bool   `json:"visible"`
-		SongCommand          string `json:"song_command"`
-		SongCommandTimeout   int    `json:"song_command_timeout"`
-		OnPlayCommand        string `json:"on_play_command"`
-		OnPlayCommandTimeout int    `json:"on_play_command_timeout"`
+		Name                 string  `json:"name"`
+		Mount                string  `json:"mount"`
+		MusicDir             string  `json:"music_dir"`
+		Format               string  `json:"format"`
+		Bitrate              int     `json:"bitrate"`
+		Loop                 bool    `json:"loop"`
+		InjectMetadata       bool    `json:"inject_metadata"`
+		MPDEnabled           bool    `json:"mpd_enabled"`
+		MPDPort              string  `json:"mpd_port"`
+		MPDPassword          string  `json:"mpd_password"`
+		Visible              bool    `json:"visible"`
+		SongCommand          string  `json:"song_command"`
+		SongCommandTimeout   int     `json:"song_command_timeout"`
+		OnPlayCommand        string  `json:"on_play_command"`
+		OnPlayCommandTimeout int     `json:"on_play_command_timeout"`
+		Source               string  `json:"source"`
+		NeteasePlaylists     []int64 `json:"netease_playlists"`
+		IdleSkip             bool    `json:"idle_skip"`
+		AutoCachePlaylist    bool    `json:"auto_cache_playlist"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, "Invalid request body", http.StatusBadRequest)
@@ -603,10 +618,6 @@ func (s *Server) apiCreateAutoDJ(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Name == "" || body.Mount == "" {
 		jsonError(w, "Name and mount are required", http.StatusBadRequest)
-		return
-	}
-	if body.MusicDir == "" && body.SongCommand == "" {
-		jsonError(w, "Either music_dir or song_command is required", http.StatusBadRequest)
 		return
 	}
 	if body.Mount[0] != '/' {
@@ -624,6 +635,19 @@ func (s *Server) apiCreateAutoDJ(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Bitrate == 0 {
 		body.Bitrate = 128
+	}
+	source := config.NormalizeAutoDJSource(body.Source)
+	if source == config.AutoDJSourceNetease {
+		body.NeteasePlaylists = positivePlaylistIDs(body.NeteasePlaylists)
+		if len(body.NeteasePlaylists) == 0 {
+			jsonError(w, "netease_playlists is required for the netease source", http.StatusBadRequest)
+			return
+		}
+		body.MusicDir = ""
+		body.SongCommand = ""
+	} else if body.MusicDir == "" && body.SongCommand == "" {
+		jsonError(w, "Either music_dir or song_command is required", http.StatusBadRequest)
+		return
 	}
 
 	absMusicDir := ""
@@ -648,13 +672,19 @@ func (s *Server) apiCreateAutoDJ(w http.ResponseWriter, r *http.Request) {
 		SongCommandTimeout:   body.SongCommandTimeout,
 		OnPlayCommand:        body.OnPlayCommand,
 		OnPlayCommandTimeout: body.OnPlayCommandTimeout,
+		Source:               source,
+		NeteasePlaylists:     body.NeteasePlaylists,
+		IdleSkip:             body.IdleSkip,
+		AutoCachePlaylist:    body.AutoCachePlaylist,
 	}
 
 	s.Config.AutoDJs = append(s.Config.AutoDJs, adj)
 	s.Config.SaveConfig()
 
-	streamer, err := s.StreamerM.StartStreamer(adj.Name, adj.Mount, adj.MusicDir, adj.Loop, adj.Format, adj.Bitrate, adj.InjectMetadata, nil, adj.MPDEnabled, adj.MPDPort, adj.MPDPassword, adj.Visible, "", adj.SongCommand, adj.SongCommandTimeout, adj.OnPlayCommand, adj.OnPlayCommandTimeout)
+	streamer, err := s.StreamerM.StartStreamer(adj)
 	if err != nil {
+		s.Config.AutoDJs = removeAutoDJByMount(s.Config.AutoDJs, adj.Mount)
+		s.Config.SaveConfig()
 		jsonError(w, fmt.Sprintf("Failed to start AutoDJ: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -663,12 +693,43 @@ func (s *Server) apiCreateAutoDJ(w http.ResponseWriter, r *http.Request) {
 			st.SetVisible(adj.Visible)
 		}
 	}
-	if adj.MusicDir != "" {
+	if source == config.AutoDJSourceLocal && adj.MusicDir != "" {
 		streamer.ScanMusicDir()
 	}
 	streamer.Play()
+	if adj.AutoCachePlaylist {
+		s.syncAutoCachePlaylists()
+	}
 	jsonResponse(w, map[string]string{"status": "created", "mount": adj.Mount})
 	s.Audit(r, "autodj_created", "autodj", body.Mount, body.Name)
+}
+
+// positivePlaylistIDs drops zero/negative entries from a JSON body and
+// removes duplicates while preserving order.
+func positivePlaylistIDs(ids []int64) []int64 {
+	out := make([]int64, 0, len(ids))
+	seen := make(map[int64]struct{}, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
+func removeAutoDJByMount(list []*config.AutoDJConfig, mount string) []*config.AutoDJConfig {
+	out := list[:0]
+	for _, adj := range list {
+		if adj.Mount != mount {
+			out = append(out, adj)
+		}
+	}
+	return out
 }
 
 // apiUpdateAutoDJ edits an existing AutoDJ in place, keyed by its current
@@ -725,6 +786,12 @@ func (s *Server) apiUpdateAutoDJ(w http.ResponseWriter, r *http.Request) {
 		SongCommandTimeout   int     `json:"song_command_timeout"`
 		OnPlayCommand        string  `json:"on_play_command"`
 		OnPlayCommandTimeout int     `json:"on_play_command_timeout"`
+		// NetEase fields use pointers so a partial update can leave the
+		// current source and playlist untouched.
+		Source            string   `json:"source"`
+		NeteasePlaylists  *[]int64 `json:"netease_playlists"`
+		IdleSkip          *bool    `json:"idle_skip"`
+		AutoCachePlaylist *bool    `json:"auto_cache_playlist"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		jsonError(w, "Invalid request body", http.StatusBadRequest)
@@ -750,7 +817,25 @@ func (s *Server) apiUpdateAutoDJ(w http.ResponseWriter, r *http.Request) {
 	if newMount[0] != '/' {
 		newMount = "/" + newMount
 	}
-	if body.MusicDir == "" && body.SongCommand == "" {
+
+	source := target.Source
+	if body.Source != "" {
+		source = config.NormalizeAutoDJSource(body.Source)
+	} else {
+		source = config.NormalizeAutoDJSource(source)
+	}
+	playlists := append([]int64(nil), target.NeteasePlaylists...)
+	if body.NeteasePlaylists != nil {
+		playlists = positivePlaylistIDs(*body.NeteasePlaylists)
+	}
+	if source == config.AutoDJSourceNetease {
+		if len(playlists) == 0 {
+			jsonError(w, "netease_playlists is required for the netease source", http.StatusBadRequest)
+			return
+		}
+		body.MusicDir = ""
+		body.SongCommand = ""
+	} else if body.MusicDir == "" && body.SongCommand == "" {
 		jsonError(w, "Either music_dir or song_command is required", http.StatusBadRequest)
 		return
 	}
@@ -780,6 +865,14 @@ func (s *Server) apiUpdateAutoDJ(w http.ResponseWriter, r *http.Request) {
 	}
 	target.Mount = newMount
 	target.MusicDir = absMusicDir
+	target.Source = source
+	target.NeteasePlaylists = playlists
+	if source != config.NormalizeAutoDJSource(prev.Source) {
+		// The old list belonged to the other source; keeping it would
+		// make a NetEase AutoDJ play leftover local files while its
+		// playlist fetch is still in flight.
+		target.Playlist = nil
+	}
 	if body.Format != "" {
 		target.Format = body.Format
 	}
@@ -804,6 +897,12 @@ func (s *Server) apiUpdateAutoDJ(w http.ResponseWriter, r *http.Request) {
 	if body.Visible != nil {
 		target.Visible = *body.Visible
 	}
+	if body.IdleSkip != nil {
+		target.IdleSkip = *body.IdleSkip
+	}
+	if body.AutoCachePlaylist != nil {
+		target.AutoCachePlaylist = *body.AutoCachePlaylist
+	}
 	target.SongCommand = body.SongCommand
 	target.SongCommandTimeout = body.SongCommandTimeout
 	target.OnPlayCommand = body.OnPlayCommand
@@ -813,20 +912,10 @@ func (s *Server) apiUpdateAutoDJ(w http.ResponseWriter, r *http.Request) {
 	// if the new configuration can't start (a taken MPD port, a bad
 	// music dir) we must be able to put the previous one back. Saving
 	// first left the config describing an AutoDJ that doesn't exist.
-	streamer, err := s.StreamerM.StartStreamer(
-		target.Name, target.Mount, target.MusicDir, target.Loop, target.Format, target.Bitrate,
-		target.InjectMetadata, target.Playlist, target.MPDEnabled, target.MPDPort, target.MPDPassword,
-		target.Visible, target.LastPlaylist, target.SongCommand, target.SongCommandTimeout,
-		target.OnPlayCommand, target.OnPlayCommandTimeout,
-	)
+	streamer, err := s.StreamerM.StartStreamer(target)
 	if err != nil {
 		*target = prev
-		if restored, rerr := s.StreamerM.StartStreamer(
-			target.Name, target.Mount, target.MusicDir, target.Loop, target.Format, target.Bitrate,
-			target.InjectMetadata, target.Playlist, target.MPDEnabled, target.MPDPort, target.MPDPassword,
-			target.Visible, target.LastPlaylist, target.SongCommand, target.SongCommandTimeout,
-			target.OnPlayCommand, target.OnPlayCommandTimeout,
-		); rerr == nil {
+		if restored, rerr := s.StreamerM.StartStreamer(target); rerr == nil {
 			restored.Play()
 			logger.L.Warnw("AutoDJ update failed; previous configuration restored",
 				"mount", target.Mount, "error", err)
@@ -838,10 +927,13 @@ func (s *Server) apiUpdateAutoDJ(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.Config.SaveConfig()
-	if target.MusicDir != "" {
+	if source == config.AutoDJSourceLocal && target.MusicDir != "" {
 		streamer.ScanMusicDir()
 	}
 	streamer.Play()
+	if target.AutoCachePlaylist {
+		s.syncAutoCachePlaylists()
+	}
 	jsonResponse(w, map[string]string{"status": "updated", "mount": target.Mount})
 	s.Audit(r, "autodj_updated", "autodj", target.Mount, target.Name)
 }

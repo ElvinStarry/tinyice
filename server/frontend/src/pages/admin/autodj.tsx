@@ -10,6 +10,7 @@ import { Icon } from '@/ui/icons'
 import { dj, qk, useInstances, type DjInstance } from './autodj/api'
 import { InstanceCard } from './autodj/InstanceCard'
 import { InstanceForm } from './autodj/InstanceForm'
+import { NeteaseAccount } from './autodj/NeteaseAccount'
 import './autodj/deckState' // registers the page's extra icons
 
 export default function AutoDJPage() {
@@ -43,6 +44,8 @@ export default function AutoDJPage() {
           <Button size="sm" onClick={() => q.refetch()}>Retry</Button>
         </div>
       )}
+
+      {canAdmin && <div className="mb-3"><NeteaseAccount /></div>}
 
       {q.isLoading ? (
         <div className="grid gap-3 xl:grid-cols-2">{[0, 1].map((i) => <Skeleton key={i} className="h-72 w-full" />)}</div>

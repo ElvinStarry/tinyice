@@ -399,12 +399,13 @@ func EncodeMP3(ctx context.Context, relay *Relay, output *Stream, decoder io.Rea
 				totalSamples += int64(n / 4) // 2 channels, 2 bytes per sample
 			}
 
-			// Idle gate — when the output mount has no listeners, skip
-			// the encode + broadcast. Decoder still drains so the
-			// upstream input buffer doesn't overrun us; encoder side
-			// CPU is the dominant cost so this is the lever. The
-			// encoder's bit-reservoir state may produce one suboptimal
-			// frame on the next listener join, which is inaudible.
+			// Idle gate — when the output mount has no subscribers
+			// (real listeners or an attached transcoder), skip the
+			// encode + broadcast. Decoder still drains so the upstream
+			// input buffer doesn't overrun us; encoder side CPU is the
+			// dominant cost so this is the lever. The encoder's
+			// bit-reservoir state may produce one suboptimal frame on
+			// the next listener join, which is inaudible.
 			//
 			// This skips the encode ONLY. It must never skip the pacing
 			// sleep below: on a file-backed source (AutoDJ) the sleep is
@@ -413,7 +414,7 @@ func EncodeMP3(ctx context.Context, relay *Relay, output *Stream, decoder io.Rea
 			// playlist as fast as the CPU allowed. Measured on r4dio
 			// 2026-09-30: two idle AutoDJ mounts burned 207% CPU, ~90%
 			// of it inside go-mp3, with only 27 goroutines alive.
-			if output.ListenersCount() == 0 {
+			if output.SubscriberCount() == 0 {
 				// Producer is alive and on schedule, just not emitting.
 				// Keep the mount out of the HealthMonitor's dead-stream
 				// sweep; see Stream.MarkProducerAlive.
@@ -531,7 +532,7 @@ func EncodeOpus(ctx context.Context, relay *Relay, output *Stream, decoder io.Re
 
 			// Idle gate — see EncodeMP3 for rationale, including why it
 			// guards the encode only and never the pacing sleep.
-			if output.ListenersCount() == 0 {
+			if output.SubscriberCount() == 0 {
 				output.MarkProducerAlive()
 			} else {
 				for i := 0; i < len(pcmSamples); i++ {

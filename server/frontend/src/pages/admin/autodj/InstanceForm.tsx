@@ -11,11 +11,13 @@ interface Form {
   loop: boolean; inject_metadata: boolean; visible: boolean
   mpd_enabled: boolean; mpd_port: string; mpd_password: string
   song_command: string; song_command_timeout: string; on_play_command: string; on_play_command_timeout: string
+  source: 'local' | 'netease'; netease_playlists: string; idle_skip: boolean; auto_cache_playlist: boolean
 }
 
 const blank: Form = {
   name: '', mount: '', music_dir: '', format: 'mp3', bitrate: '128', loop: true, inject_metadata: true, visible: true,
   mpd_enabled: false, mpd_port: '', mpd_password: '', song_command: '', song_command_timeout: '5', on_play_command: '', on_play_command_timeout: '10',
+  source: 'local', netease_playlists: '', idle_skip: false, auto_cache_playlist: false,
 }
 
 const fromInstance = (i: DjInstance): Form => ({
@@ -23,7 +25,16 @@ const fromInstance = (i: DjInstance): Form => ({
   loop: i.loop, inject_metadata: i.inject_metadata, visible: i.visible, mpd_enabled: i.mpd_enabled, mpd_port: i.mpd_port, mpd_password: '',
   song_command: i.song_command, song_command_timeout: String(i.song_command_timeout || 5),
   on_play_command: i.on_play_command, on_play_command_timeout: String(i.on_play_command_timeout || 10),
+  source: i.source === 'netease' ? 'netease' : 'local',
+  netease_playlists: (i.netease_playlists || []).join(', '),
+  idle_skip: !!i.idle_skip,
+  auto_cache_playlist: !!i.auto_cache_playlist,
 })
+
+/** Playlist ids are typed as "3778678, 3779629" or one per line. */
+function parsePlaylistIDs(raw: string): number[] {
+  return raw.split(/[\s,;]+/).map((s) => Number(s.trim())).filter((n) => Number.isInteger(n) && n > 0)
+}
 
 type Errors = Partial<Record<keyof Form, string>>
 
@@ -34,7 +45,9 @@ function validate(f: Form, taken: string[]): Errors {
   if (!mount) e.mount = 'Required'
   else if (!/^\/?[A-Za-z0-9._~\-/]+$/.test(mount)) e.mount = 'Use letters, digits and . _ - / only'
   else if (taken.includes(mount.startsWith('/') ? mount : `/${mount}`)) e.mount = 'Another AutoDJ already uses this mount'
-  if (!f.music_dir.trim() && !f.song_command.trim()) e.music_dir = 'A music directory or a song command is required'
+  if (f.source === 'netease') {
+    if (parsePlaylistIDs(f.netease_playlists).length === 0) e.netease_playlists = 'At least one playlist id is required'
+  } else if (!f.music_dir.trim() && !f.song_command.trim()) e.music_dir = 'A music directory or a song command is required'
   const br = Number(f.bitrate)
   if (!Number.isInteger(br) || br < 8 || br > 512) e.bitrate = '8 to 512 kbps'
   if (f.mpd_enabled && !(/^\d+$/.test(f.mpd_port) && Number(f.mpd_port) >= 1 && Number(f.mpd_port) <= 65535)) e.mpd_port = 'A TCP port from 1 to 65535'
@@ -72,10 +85,16 @@ export function InstanceForm({ open, onOpenChange, instance, existingMounts }: {
     if (Object.keys(errs).length) return
     const mount = f.mount.trim().startsWith('/') ? f.mount.trim() : `/${f.mount.trim()}`
     const cfg: DjConfig = {
-      name: f.name.trim(), mount, music_dir: f.music_dir.trim(), format: f.format, bitrate: Number(f.bitrate),
+      name: f.name.trim(), mount, format: f.format, bitrate: Number(f.bitrate),
       loop: f.loop, inject_metadata: f.inject_metadata, visible: f.visible, mpd_enabled: f.mpd_enabled, mpd_port: f.mpd_enabled ? f.mpd_port : '',
-      song_command: f.song_command.trim(), on_play_command: f.on_play_command.trim(),
-      ...(f.song_command.trim() ? { song_command_timeout: Number(f.song_command_timeout) } : {}),
+      music_dir: f.source === 'local' ? f.music_dir.trim() : '',
+      song_command: f.source === 'local' ? f.song_command.trim() : '',
+      on_play_command: f.on_play_command.trim(),
+      source: f.source,
+      netease_playlists: f.source === 'netease' ? parsePlaylistIDs(f.netease_playlists) : [],
+      idle_skip: f.idle_skip,
+      auto_cache_playlist: f.source === 'netease' ? f.auto_cache_playlist : false,
+      ...(f.source === 'local' && f.song_command.trim() ? { song_command_timeout: Number(f.song_command_timeout) } : {}),
       ...(f.on_play_command.trim() ? { on_play_command_timeout: Number(f.on_play_command_timeout) } : {}),
       // Sent only when typed: an empty value means "keep the stored password".
       ...(f.mpd_enabled && f.mpd_password ? { mpd_password: f.mpd_password } : {}),
@@ -95,7 +114,11 @@ export function InstanceForm({ open, onOpenChange, instance, existingMounts }: {
       <Dialog
         open={open} onOpenChange={(o) => !busy && onOpenChange(o)} width="max-w-xl"
         title={instance ? `Edit ${instance.mount}` : 'New AutoDJ'}
-        description={instance ? 'The AutoDJ restarts with the new settings. Its playlist and queue are kept.' : 'Plays a music directory into a mount, with a playlist and a queue.'}
+        description={instance
+          ? 'The AutoDJ restarts with the new settings. Its playlist and queue are kept.'
+          : f.source === 'netease'
+            ? 'Plays the tracks of one or more NetEase Cloud Music playlists into a mount.'
+            : 'Plays a music directory into a mount, with a playlist and a queue.'}
         footer={<>
           {serverError && <p role="alert" className="mr-auto max-w-[60%] text-xs text-danger">{serverError}</p>}
           <Button variant="ghost" onClick={() => onOpenChange(false)} disabled={busy}>Cancel</Button>
@@ -107,12 +130,21 @@ export function InstanceForm({ open, onOpenChange, instance, existingMounts }: {
             <Field label="Name" error={errors.name}><Input value={f.name} onChange={(e) => set('name', e.target.value)} placeholder="Main rotation" autoFocus aria-invalid={!!errors.name} /></Field>
             <Field label="Mount" error={errors.mount} hint="Where listeners tune in"><Input mono value={f.mount} onChange={(e) => set('mount', e.target.value)} placeholder="/radio" aria-invalid={!!errors.mount} /></Field>
           </div>
-          <Field label="Music directory" error={errors.music_dir} hint="Pasting a path works even where no media root covers the library yet.">
-            <div className="flex gap-2">
-              <Input mono value={f.music_dir} onChange={(e) => set('music_dir', e.target.value)} placeholder="/srv/music" aria-invalid={!!errors.music_dir} />
-              <Button type="button" onClick={() => setBrowse(true)}><Icon name="folder" size={14} />Browse</Button>
-            </div>
+          <Field label="Source" hint="Local files or NetEase Cloud Music playlists (one account serves every NetEase AutoDJ)">
+            <Select value={f.source} onValueChange={(v) => set('source', v as Form['source'])} options={[{ value: 'local', label: 'Local files' }, { value: 'netease', label: 'NetEase Cloud Music' }]} />
           </Field>
+          {f.source === 'local' ? (
+            <Field label="Music directory" error={errors.music_dir} hint="Pasting a path works even where no media root covers the library yet.">
+              <div className="flex gap-2">
+                <Input mono value={f.music_dir} onChange={(e) => set('music_dir', e.target.value)} placeholder="/srv/music" aria-invalid={!!errors.music_dir} />
+                <Button type="button" onClick={() => setBrowse(true)}><Icon name="folder" size={14} />Browse</Button>
+              </div>
+            </Field>
+          ) : (
+            <Field label="NetEase playlist IDs" error={errors.netease_playlists} hint="Comma separated. The id is the number in music.163.com/playlist?id=…; tracks from all lists are merged by music id.">
+              <Input mono value={f.netease_playlists} onChange={(e) => set('netease_playlists', e.target.value)} placeholder="3778678, 3779629" aria-invalid={!!errors.netease_playlists} />
+            </Field>
+          )}
           <div className="grid gap-3 sm:grid-cols-2">
             <Field label="Format" hint="MP3 and Opus are the formats the encoder implements">
               <Select value={f.format} onValueChange={(v) => set('format', v)} options={[{ value: 'mp3', label: 'MP3' }, { value: 'opus', label: 'Opus' }]} />
@@ -124,6 +156,10 @@ export function InstanceForm({ open, onOpenChange, instance, existingMounts }: {
             <Row label="Loop the playlist" help="Start over when the last track ends"><Switch label="Loop the playlist" checked={f.loop} onCheckedChange={(v) => set('loop', v)} /></Row>
             <Row label="Send track titles" help="Publish the current song as stream metadata"><Switch label="Send track titles" checked={f.inject_metadata} onCheckedChange={(v) => set('inject_metadata', v)} /></Row>
             <Row label="Listed publicly" help="Off: still streamable by URL, but not listed"><Switch label="Listed publicly" checked={f.visible} onCheckedChange={(v) => set('visible', v)} /></Row>
+            <Row label="Skip decoding while idle" help="With no listeners, advance the playlist on track time without decoding or downloading. A listener who joins mid-track resumes at the elapsed position. Tracks that finish while idle do not fire on-play hooks or webhooks."><Switch label="Skip decoding while idle" checked={f.idle_skip} onCheckedChange={(v) => set('idle_skip', v)} /></Row>
+            {f.source === 'netease' && (
+              <Row label="Auto-update cache" help="When the NetEase playlist gains or loses tracks, download new tracks and delete cached files for removed tracks that no other AutoDJ uses."><Switch label="Auto-update cache" checked={f.auto_cache_playlist} onCheckedChange={(v) => set('auto_cache_playlist', v)} /></Row>
+            )}
           </div>
 
           <div className="space-y-3 rounded-md border border-line p-3">
@@ -137,10 +173,14 @@ export function InstanceForm({ open, onOpenChange, instance, existingMounts }: {
           </div>
 
           <div className="space-y-3 rounded-md border border-line p-3">
-            <Field label="Song command" hint="Prints the path of the next song. Overrides the playlist; falls back to it on failure.">
-              <Input mono value={f.song_command} onChange={(e) => set('song_command', e.target.value)} placeholder="node /home/radio/getSong.js" />
-            </Field>
-            {f.song_command.trim() && <Field label="Song command timeout (s)" error={errors.song_command_timeout}><Input mono type="number" className="w-28" min={1} max={30} value={f.song_command_timeout} onChange={(e) => set('song_command_timeout', e.target.value)} /></Field>}
+            {f.source === 'local' && (
+              <>
+                <Field label="Song command" hint="Prints the path of the next song. Overrides the playlist; falls back to it on failure.">
+                  <Input mono value={f.song_command} onChange={(e) => set('song_command', e.target.value)} placeholder="node /home/radio/getSong.js" />
+                </Field>
+                {f.song_command.trim() && <Field label="Song command timeout (s)" error={errors.song_command_timeout}><Input mono type="number" className="w-28" min={1} max={30} value={f.song_command_timeout} onChange={(e) => set('song_command_timeout', e.target.value)} /></Field>}
+              </>
+            )}
             <Field label="On-play command" hint="Runs when a track starts. Environment: TINYICE_ARTIST, TINYICE_TITLE, TINYICE_ALBUM, TINYICE_FILE, TINYICE_MOUNT.">
               <Input mono value={f.on_play_command} onChange={(e) => set('on_play_command', e.target.value)} placeholder="/usr/local/bin/notify.sh" />
             </Field>

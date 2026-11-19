@@ -691,6 +691,11 @@ type icyState struct {
 // meaningless; the cap keeps a mistyped value from being stored.
 const maxBurstSize = 8 * 1024 * 1024
 
+// autoDJBurstSize is the default burst for an AutoDJ mount. Large enough
+// for a few seconds of client buffering, small enough that a pause/play
+// or a reconnect does not replay half of the previous song.
+const autoDJBurstSize = 64 * 1024
+
 func (s *Server) serveStreamData(w http.ResponseWriter, r *http.Request, stream *relay.Stream, id, originalMount, currentMount string, recoveryTicker *time.Ticker, metaint int, icy *icyState) bool {
 	// Burst size defaults to 512 KiB but can be overridden per mount via
 	// AdvancedMounts.BurstSize (the "Advanced Mount Settings" UI field).
@@ -698,6 +703,13 @@ func (s *Server) serveStreamData(w http.ResponseWriter, r *http.Request, stream 
 	// of audio into the client's cache on connect, so a ~5 s network stall
 	// no longer drains the player's buffer and forces a reconnect.
 	burst := 512 * 1024
+	// AutoDJ mounts are music, not a continuous live event: a 512 KiB
+	// burst is up to 32 seconds at 128 kbps, which makes browsers and VLC
+	// start deep inside a previous song. 64 KiB keeps a few seconds of
+	// resilience while staying close to live.
+	if s.StreamerM != nil && s.StreamerM.GetStreamer(currentMount) != nil {
+		burst = autoDJBurstSize
+	}
 	if adv, ok := s.Config.AdvancedMounts[currentMount]; ok && adv != nil && adv.BurstSize > 0 {
 		burst = adv.BurstSize
 		if burst > maxBurstSize {

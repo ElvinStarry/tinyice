@@ -1050,6 +1050,16 @@ func (s *Stream) ListenersCount() int {
 	return len(s.listeners) - len(s.internalListeners)
 }
 
+// SubscriberCount includes internal subscribers. The encoder idle gate and
+// the AutoDJ idle skip use it because an attached transcoder needs samples
+// even when no real listener is on this mount yet; skipping production
+// would starve every downstream output.
+func (s *Stream) SubscriberCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.listeners)
+}
+
 // GetStartedTime returns the stream start time (implements TimeProvider interface)
 func (s *Stream) GetStartedTime() time.Time {
 	s.mu.RLock()

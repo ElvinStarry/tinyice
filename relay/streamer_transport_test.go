@@ -25,7 +25,7 @@ func newTestStreamer(t *testing.T) (*Streamer, *StreamerManager) {
 		idleCh:      make(chan string, 1),
 		stateCh:     make(chan struct{}, 1),
 	}
-	return s, NewStreamerManager(NewRelay(false, nil), nil)
+	return s, NewStreamerManager(NewRelay(false, nil), nil, nil)
 }
 
 // Stop and Pause are transport operations: they must leave the

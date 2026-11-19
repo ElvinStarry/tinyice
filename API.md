@@ -83,10 +83,10 @@ http://localhost:8080
 
 | Endpoint | Method | Parameters | Description |
 |----------|--------|------------|-------------|
-| `/admin/autodj/add` | POST | `name`, `mount`, `music_dir`, `format`, `bitrate`, `loop`, `inject_metadata`, `mpd_enabled`, `mpd_port`, `mpd_password`, `visible` | Add AutoDJ |
+| `/admin/autodj/add` | POST | `name`, `mount`, `music_dir`, `format`, `bitrate`, `loop`, `inject_metadata`, `mpd_enabled`, `mpd_port`, `mpd_password`, `visible`, `source`, `netease_playlists`, `idle_skip` | Add AutoDJ |
 | `/admin/autodj/delete` | POST | `mount` | Delete AutoDJ |
 | `/admin/autodj/toggle` | POST | `mount` | Enable/disable AutoDJ |
-| `/admin/autodj/update` | POST | `old_mount`, `name`, `mount`, `music_dir`, `format`, `bitrate`, `loop`, `inject_metadata`, `mpd_enabled`, `mpd_port`, `mpd_password`, `visible` | Update AutoDJ |
+| `/admin/autodj/update` | POST | `old_mount`, `name`, `mount`, `music_dir`, `format`, `bitrate`, `loop`, `inject_metadata`, `mpd_enabled`, `mpd_port`, `mpd_password`, `visible`, `source`, `netease_playlists`, `idle_skip` | Update AutoDJ |
 | `/admin/autodj/studio` | GET | `mount` (query) | AutoDJ studio interface |
 
 ### AutoDJ Controls
@@ -109,6 +109,54 @@ http://localhost:8080
 | `/admin/player/files` | GET | `mount`, `path` (query) | Browse music files (JSON) |
 | `/admin/player/playlist-action` | POST | `mount`, `action`, `file`, `index` | Playlist actions (`add`, `remove`) |
 | `/admin/player/playlist-info` | GET | `mount` (query) | Get playlist info (JSON) |
+
+### NetEase Cloud Music (AutoDJ source)
+
+One account serves every AutoDJ whose `source` is `netease`. The cookie is
+stored in the `netease` section of the config file, never returned by the API.
+
+| Endpoint | Method | Body / query | Description |
+|----------|--------|--------------|-------------|
+| `/api/netease` | GET | `check=1` (optional) | Account, cookie and cache status |
+| `/api/netease/qr` | POST | `{}` | Start QR login; returns `key`, `qr` (PNG data URI), `expires_in` |
+| `/api/netease/qr` | POST | `{"key":"…"}` | Poll the QR; `waiting`, `scanned`, `success`, `expired` |
+| `/api/netease/logout` | POST | `{}` | Forget the cookie |
+| `/api/netease/cache` | POST | `{"enabled":true,"dir":"netease-cache"}` | Cache switch and directory |
+| `/api/autodj/{mount}/netease/cache` | POST | — | Start caching every NetEase track in the AutoDJ's current playlist |
+| `/api/autodj/{mount}/netease/cache` | GET | — | Cache job progress: `total`, `done`, `failed`, `cached`, `active`, `error` |
+
+`POST /api/autodj` and `PUT /api/autodj?mount=` accept:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `source` | `"local"` or `"netease"` | Track source, default `local` |
+| `netease_playlists` | `[]int64` | Playlist ids; tracks are merged and deduplicated by music id |
+| `idle_skip` | `bool` | While the mount has no listeners, advance on track time without decoding or downloading; a listener who joins resumes at the elapsed position. Tracks consumed entirely while idle do not fire on-play hooks |
+| `auto_cache_playlist` | `bool` | On NetEase playlist changes, download new tracks and delete cached files for removed tracks when no other AutoDJ or prefetch uses them |
+
+Tracks request `exhigh` (320 kbps) first, then `hires` (FLAC) when exhigh has
+no URL. A lower level returned by NetEase is accepted, and a track with no URL
+at any level is skipped; TinyIce does not pin the stream to one quality. Files
+are cached as `<cache-dir>/<music-id>.<ext>`; with caching off they are written
+to a temporary file and deleted after playback. A cache miss streams the HTTP
+body into a `.part` file while the decoder follows the growing file, so
+playback starts without waiting for the whole download; the completed file is
+size/MD5 checked and renamed into place. A stream that makes no download
+progress or produces no decoded PCM for five seconds skips to the next track,
+and three consecutive stream failures restart the playlist from its first
+entry. During the last 30 seconds of a
+track the next playlist entry is prefetched, including while the mount is
+idle, so the following transition does not wait on the CDN. The playlist is
+refreshed every ten minutes and a failure keeps the last working list. The
+AutoDJ card's **Cache playlist** button starts a background job that downloads
+every NetEase track in that instance's current playlist; it requires the
+download cache to be enabled and a signed-in account. Job progress is
+persisted next to the config file (`<config>.cache-state.json`) so the last
+completed or interrupted run is still visible after a restart; interrupted
+batches requeue their ids and resume as cache hits for completed tracks. With
+`auto_cache_playlist` enabled, a successful playlist refresh queues new music
+ids for caching and removes cached files for deleted tracks that no other
+AutoDJ, queue, current track, or prefetch still references.
 
 ### Relay Management
 

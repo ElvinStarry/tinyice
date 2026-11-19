@@ -30,6 +30,10 @@ export interface DjInstance {
   song_command_timeout: number
   on_play_command: string
   on_play_command_timeout: number
+  source: 'local' | 'netease'
+  netease_playlists: number[]
+  idle_skip: boolean
+  auto_cache_playlist: boolean
   queue: PlaylistItem[] | null
 }
 
@@ -50,6 +54,10 @@ export interface DjConfig {
   song_command_timeout?: number
   on_play_command: string
   on_play_command_timeout?: number
+  source: 'local' | 'netease'
+  netease_playlists: number[]
+  idle_skip: boolean
+  auto_cache_playlist: boolean
 }
 
 /** GET /api/autodj/browse (browseResponse in handlers_media_browse.go). */
@@ -126,6 +134,47 @@ export const dj = {
   create: (cfg: DjConfig) => send('/api/autodj', cfg),
   update: (mount: string, cfg: DjConfig) => send(`/api/autodj?mount=${encodeURIComponent(mount)}`, cfg, 'PUT'),
   remove_instance: (mount: string) => send(`/api/autodj?mount=${encodeURIComponent(mount)}`, undefined, 'DELETE'),
+}
+
+export interface NeteaseStatus {
+  logged_in: boolean
+  state: string
+  nickname: string
+  checked_at: number
+  last_error: string
+  cache_enabled: boolean
+  cache_dir: string
+  music_u_set: boolean
+}
+
+/** Progress of POST/GET /api/autodj/{mount}/netease/cache. */
+export interface NeteaseCacheJob {
+  mount: string
+  total: number
+  done: number
+  failed: number
+  cached?: number
+  active: boolean
+  error?: string
+  started_at?: number
+  finished_at?: number
+}
+
+export interface NeteaseQR {
+  key: string
+  qr: string
+  expires_in: number
+}
+
+/** One account serves every NetEase AutoDJ. */
+export const netease = {
+  status: (check = false) => api.get<NeteaseStatus>(`/api/netease${check ? '?check=1' : ''}`),
+  startQR: () => api.post<NeteaseQR>('/api/netease/qr'),
+  pollQR: (key: string) => api.post<{ status: 'waiting' | 'scanned' | 'success' | 'expired'; nickname?: string }>('/api/netease/qr', { key }),
+  logout: () => api.post<NeteaseStatus>('/api/netease/logout'),
+  cache: (enabled: boolean, dir: string) => api.post<NeteaseStatus>('/api/netease/cache', { enabled, dir }),
+  cachePlaylist: (mount: string) => send<NeteaseCacheJob>(`${base(mount)}/netease/cache`),
+  cachePlaylistStatus: (mount: string) => api.get<NeteaseCacheJob>(`${base(mount)}/netease/cache`),
 }
 
 export const qk = {

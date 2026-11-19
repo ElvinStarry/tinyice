@@ -5,6 +5,70 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.14.0] - 2026-11-20
+
+### Added
+
+- **NetEase Cloud Music AutoDJ source.** An AutoDJ can now play one or more
+  NetEase playlists instead of a local directory. Sign-in is QR-only, the
+  account cookie is re-validated every ten minutes, playback asks for
+  `exhigh` (320 kbps) first and accepts a lower level when necessary, and the
+  download cache is keyed by music id so a
+  song shared by several playlists is stored once. The cache can be turned off;
+  temporary files are then deleted after playback. Configure it from the
+  AutoDJ page (account panel) or through `source` / `netease_playlists` in the
+  AutoDJ API.
+- **Idle decode skip** per AutoDJ. While a mount has no listeners the loop
+  advances on each track's wall-clock duration without opening a decoder,
+  downloading a NetEase track, or encoding. The position stays tracked; a
+  listener who joins mid-track resumes at the elapsed position. Local
+  durations are read from MP3/FLAC/WAV/Ogg headers without decoding.
+- **NetEase prefetch.** During the last 30 seconds of a NetEase track the
+  next playlist entry is downloaded (or checked against the music-id cache)
+  in the background, so the transition does not wait on the CDN.
+
+### Changed
+
+- `relay.StreamerManager.StartStreamer` now takes a `*config.AutoDJConfig`
+  instead of nineteen positional arguments.
+- AutoDJ MP3 output is resampled to 44.1 kHz (Opus was already pinned to
+  48 kHz), so a mount keeps one encoder sample rate across tracks. Browsers
+  that stopped or glitched when a new file changed the stream rate now get a
+  continuous MP3 stream.
+- AutoDJ track changes checkpoint the output buffer at the current head.
+  New listeners start at the live edge instead of replaying up to the burst
+  window of the previous song, which is especially visible after idle
+  pacing. Opus tracks also start a fresh Ogg session.
+- The default burst for an AutoDJ mount is 64 KiB (4 s at 128 kbps) instead
+  of 512 KiB (32 s at 128 kbps). An explicit per-mount advanced burst size
+  still wins.
+- The AutoDJ card has a **Cache playlist** button for NetEase sources. It
+  starts a background job that downloads every NetEase track in that
+  instance's current playlist through the shared cache, with `done`/`failed`
+  progress; it requires the download cache and a signed-in account.
+- NetEase AutoDJs can enable **auto-update cache**. A successful playlist
+  refresh queues new music ids for background caching and deletes cached
+  files for removed tracks that no other AutoDJ, queue, current track, or
+  prefetch still uses.
+- Cache-playlist job snapshots persist in `<config>.cache-state.json`. After
+  a restart the last progress and a `cached` coverage count are still
+  available; a job interrupted by shutdown is marked interrupted and its ids
+  are requeued, so already-cached tracks finish as cache hits.
+- NetEase cache misses now start playback while downloading. The HTTP body is
+  written to a `.part` file and the decoder follows the growing file in
+  chunks; a completed file is size/MD5 verified before being renamed into the
+  cache. Cached tracks still open directly.
+- A stalled or failed NetEase stream (5 s without download progress or
+  decoded PCM) skips to the next track. Three consecutive stream failures
+  restart the playlist from its first entry and clear the queue.
+- The next NetEase track is prefetched near the end of the current one even
+  while the mount is idle, so the idle playback clock and the cache stay
+  ahead of a listener joining at the boundary.
+- NetEase playback no longer treats a downgraded quality as unavailable.
+  `SongURL` requests `exhigh` first, probes `hires` (FLAC) when exhigh is
+  missing or downgraded, then falls back through `higher`/`standard` and
+  returns the best URL it saw.
+
 ## [2.13.0] - 2026-11-14
 
 ### Added

@@ -186,6 +186,7 @@ func normalizeAutoDJFormats(c *Config) {
 			continue
 		}
 		dj.Format = NormalizeAutoDJFormat(dj.Format)
+		dj.Source = NormalizeAutoDJSource(dj.Source)
 	}
 }
 
@@ -203,6 +204,22 @@ func NormalizeAutoDJFormat(format string) string {
 		return "opus"
 	}
 	return "mp3"
+}
+
+// AutoDJ source identifiers. An empty Source in an existing config means
+// local files, which keeps old tinyice.json files working unchanged.
+const (
+	AutoDJSourceLocal   = "local"
+	AutoDJSourceNetease = "netease"
+)
+
+// NormalizeAutoDJSource maps anything that is not the NetEase source onto
+// the local-file source.
+func NormalizeAutoDJSource(source string) string {
+	if strings.EqualFold(strings.TrimSpace(source), AutoDJSourceNetease) {
+		return AutoDJSourceNetease
+	}
+	return AutoDJSourceLocal
 }
 
 type AutoDJConfig struct {
@@ -224,6 +241,54 @@ type AutoDJConfig struct {
 	SongCommandTimeout   int      `json:"song_command_timeout"`
 	OnPlayCommand        string   `json:"on_play_command,omitempty"`
 	OnPlayCommandTimeout int      `json:"on_play_command_timeout,omitempty"`
+
+	// Source selects where tracks come from: local files (default) or
+	// NetEase Cloud Music playlists.
+	Source string `json:"source,omitempty"`
+	// NeteasePlaylists holds the playlist IDs used when Source is
+	// "netease". Tracks from all lists are merged and deduplicated by
+	// music id.
+	NeteasePlaylists []int64 `json:"netease_playlists,omitempty"`
+	// IdleSkip stops decoding and downloading while the mount has no
+	// listeners and advances the playlist on the tracks' wall-clock
+	// duration instead. A listener who joins mid-track hears that track
+	// from its beginning.
+	IdleSkip bool `json:"idle_skip,omitempty"`
+	// AutoCachePlaylist keeps the music-id cache in sync with NetEase
+	// playlist changes: new tracks are downloaded in the background and
+	// cached files for removed tracks are deleted when no other AutoDJ
+	// or prefetch still uses them.
+	AutoCachePlaylist bool `json:"auto_cache_playlist,omitempty"`
+}
+
+// NetEaseConfig is the process-wide NetEase Cloud Music account and cache
+// configuration. One account serves every AutoDJ that uses the NetEase
+// source.
+type NetEaseConfig struct {
+	MusicU string `json:"music_u,omitempty"`
+	// CacheEnabled is a pointer so an unset field defaults to on while an
+	// explicit false still turns caching off.
+	CacheEnabled *bool  `json:"cache_enabled,omitempty"`
+	CacheDir     string `json:"cache_dir,omitempty"`
+}
+
+// CacheOn reports whether downloaded NetEase audio should be kept. The
+// zero value (unset) keeps caching on.
+func (n *NetEaseConfig) CacheOn() bool {
+	return n == nil || n.CacheEnabled == nil || *n.CacheEnabled
+}
+
+// SetCacheOn stores an explicit choice.
+func (n *NetEaseConfig) SetCacheOn(on bool) {
+	n.CacheEnabled = &on
+}
+
+// EffectiveCacheDir returns the configured directory or the default.
+func (n *NetEaseConfig) EffectiveCacheDir() string {
+	if n != nil && strings.TrimSpace(n.CacheDir) != "" {
+		return strings.TrimSpace(n.CacheDir)
+	}
+	return "netease-cache"
 }
 
 type IngestConfig struct {
@@ -315,6 +380,10 @@ type Config struct {
 	// Directory Listing (YP)
 	DirectoryListing bool   `json:"directory_listing"`
 	DirectoryServer  string `json:"directory_server"`
+
+	// NetEase Cloud Music account and download cache. Only used by
+	// AutoDJ instances whose Source is "netease".
+	NetEase *NetEaseConfig `json:"netease,omitempty"`
 
 	// Internal Streamer (AutoDJ)
 	AutoDJs []*AutoDJConfig `json:"autodjs"`
@@ -544,6 +613,12 @@ func (config *Config) initMapsAndArrays() {
 		config.AutoDJs = make([]*AutoDJConfig, 0)
 	}
 	normalizeAutoDJFormats(config)
+	if config.NetEase == nil {
+		config.NetEase = &NetEaseConfig{}
+	}
+	if config.NetEase.CacheDir == "" {
+		config.NetEase.CacheDir = "netease-cache"
+	}
 	if config.OIDCProviders == nil {
 		config.OIDCProviders = make([]*OIDCProvider, 0)
 	}

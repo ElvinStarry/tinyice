@@ -83,7 +83,7 @@ Dark and light themes, phone layouts for every page.
 | **Output** | Icecast passthrough · HLS audio · HLS audio + video · WHEP / WebRTC playback · OBS simulcast (master playlist) · embeddable player |
 | **Codecs** | MP3 · Ogg Opus · Ogg Vorbis · FLAC / FLAC-in-Ogg · WAV (8/16/24/32-bit & float) · H.264 · AAC-LC |
 | **Transcoder** | Pure-Go multi-codec decode → MP3 or Opus with automatic resampling. No FFmpeg dependency. |
-| **AutoDJ** | Multi-instance, keyframe-accurate pacing, shuffle/loop/queue, MPD protocol per instance, external track hooks |
+| **AutoDJ** | Multi-instance, keyframe-accurate pacing, shuffle/loop/queue, MPD protocol per instance, external track hooks; local files or NetEase Cloud Music playlists (QR login, exhigh/hires preferred with lower-level fallback, music-id cache), optional idle decode skip |
 | **Auth** | Username + bcrypt · Passkeys (WebAuthn) · OIDC/OAuth2 · Bearer API tokens · per-mount source passwords |
 | **Player** | 16:9 video layout · live poster thumbnails · stats overlay (codec/res/fps/GOP/bitrate, dropped frames, buffer, latency) · 60 s DVR seek |
 | **Admin UI** | Dark and light console UI · command palette (Ctrl/Cmd+K) · guided first-run setup · browser broadcasting with level meters and limiter · live audience map · phone layouts |

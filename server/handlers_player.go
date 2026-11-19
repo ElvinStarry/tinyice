@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/DatanoiseTV/tinyice/config"
@@ -733,11 +734,22 @@ func (s *Server) handleAddAutoDJ(w http.ResponseWriter, r *http.Request) {
 	visible := r.FormValue("visible") == "on"
 
 	songCommand := r.FormValue("song_command")
+	source := config.NormalizeAutoDJSource(r.FormValue("source"))
+	neteasePlaylists := parsePlaylistIDs(r.FormValue("netease_playlists"))
+	idleSkip := r.FormValue("idle_skip") == "on"
+	autoCachePlaylist := r.FormValue("auto_cache_playlist") == "on"
 	if name == "" || mount == "" {
 		http.Error(w, "Name and mount are required", http.StatusBadRequest)
 		return
 	}
-	if musicDir == "" && songCommand == "" {
+	if source == config.AutoDJSourceNetease {
+		if len(neteasePlaylists) == 0 {
+			http.Error(w, "At least one NetEase playlist id is required", http.StatusBadRequest)
+			return
+		}
+		musicDir = ""
+		songCommand = ""
+	} else if musicDir == "" && songCommand == "" {
 		http.Error(w, "Either music directory or song command is required", http.StatusBadRequest)
 		return
 	}
@@ -760,32 +772,36 @@ func (s *Server) handleAddAutoDJ(w http.ResponseWriter, r *http.Request) {
 	}
 
 	adj := &config.AutoDJConfig{
-		Name:           name,
-		Mount:          mount,
-		MusicDir:       absMusicDir,
-		Format:         format,
-		Bitrate:        bitrate,
-		Enabled:        true,
-		Loop:           loop,
-		InjectMetadata: injectMetadata,
-		MPDEnabled:     mpdEnabled,
-		MPDPort:        mpdPort,
-		MPDPassword:    mpdPassword,
-		Visible:        visible,
-		SongCommand:    songCommand,
+		Name:              name,
+		Mount:             mount,
+		MusicDir:          absMusicDir,
+		Format:            format,
+		Bitrate:           bitrate,
+		Enabled:           true,
+		Loop:              loop,
+		InjectMetadata:    injectMetadata,
+		MPDEnabled:        mpdEnabled,
+		MPDPort:           mpdPort,
+		MPDPassword:       mpdPassword,
+		Visible:           visible,
+		SongCommand:       songCommand,
+		Source:            source,
+		NeteasePlaylists:  neteasePlaylists,
+		IdleSkip:          idleSkip,
+		AutoCachePlaylist: autoCachePlaylist,
 	}
 
 	s.Config.AutoDJs = append(s.Config.AutoDJs, adj)
 	s.Config.SaveConfig()
 
-	streamer, err := s.StreamerM.StartStreamer(adj.Name, adj.Mount, adj.MusicDir, adj.Loop, adj.Format, adj.Bitrate, adj.InjectMetadata, nil, adj.MPDEnabled, adj.MPDPort, adj.MPDPassword, adj.Visible, "", adj.SongCommand, adj.SongCommandTimeout, adj.OnPlayCommand, adj.OnPlayCommandTimeout)
+	streamer, err := s.StreamerM.StartStreamer(adj)
 	if err == nil {
 		if adj.InjectMetadata {
 			if st, ok := s.Relay.GetStream(adj.Mount); ok {
 				st.SetVisible(adj.Visible)
 			}
 		}
-		if adj.MusicDir != "" {
+		if source == config.AutoDJSourceLocal && adj.MusicDir != "" {
 			streamer.ScanMusicDir()
 		}
 		streamer.Play()
@@ -844,15 +860,14 @@ func (s *Server) handleToggleAutoDJ(w http.ResponseWriter, r *http.Request) {
 
 			if adj.Enabled {
 				if existing == nil {
-					absMusicDir, _ := filepath.Abs(adj.MusicDir)
-					streamer, err := s.StreamerM.StartStreamer(adj.Name, adj.Mount, absMusicDir, adj.Loop, adj.Format, adj.Bitrate, adj.InjectMetadata, adj.Playlist, adj.MPDEnabled, adj.MPDPort, adj.MPDPassword, adj.Visible, adj.LastPlaylist, adj.SongCommand, adj.SongCommandTimeout, adj.OnPlayCommand, adj.OnPlayCommandTimeout)
+					streamer, err := s.StreamerM.StartStreamer(adj)
 					if err == nil {
 						if adj.InjectMetadata {
 							if st, ok := s.Relay.GetStream(adj.Mount); ok {
 								st.SetVisible(adj.Visible)
 							}
 						}
-						if len(adj.Playlist) == 0 {
+						if config.NormalizeAutoDJSource(adj.Source) == config.AutoDJSourceLocal && len(adj.Playlist) == 0 {
 							streamer.ScanMusicDir()
 						}
 						streamer.Play()
@@ -879,6 +894,22 @@ func (s *Server) handleToggleAutoDJ(w http.ResponseWriter, r *http.Request) {
 
 	s.Config.SaveConfig()
 	http.Redirect(w, r, "/admin#tab-streamer", http.StatusSeeOther)
+}
+
+// parsePlaylistIDs accepts the legacy form's comma/space separated list of
+// NetEase playlist ids.
+func parsePlaylistIDs(raw string) []int64 {
+	fields := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\n' || r == '\t' || r == ';'
+	})
+	out := make([]int64, 0, len(fields))
+	for _, f := range fields {
+		id, err := strconv.ParseInt(strings.TrimSpace(f), 10, 64)
+		if err == nil && id > 0 {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 func (s *Server) handleAutoDJStudio(w http.ResponseWriter, r *http.Request) {
@@ -943,11 +974,22 @@ func (s *Server) handleUpdateAutoDJ(w http.ResponseWriter, r *http.Request) {
 	visible := r.FormValue("visible") == "on"
 
 	songCommand := r.FormValue("song_command")
+	source := config.NormalizeAutoDJSource(r.FormValue("source"))
+	neteasePlaylists := parsePlaylistIDs(r.FormValue("netease_playlists"))
+	idleSkip := r.FormValue("idle_skip") == "on"
+	autoCachePlaylist := r.FormValue("auto_cache_playlist") == "on"
 	if name == "" || newMount == "" {
 		http.Error(w, "Name and mount are required", http.StatusBadRequest)
 		return
 	}
-	if musicDir == "" && songCommand == "" {
+	if source == config.AutoDJSourceNetease {
+		if len(neteasePlaylists) == 0 {
+			http.Error(w, "At least one NetEase playlist id is required", http.StatusBadRequest)
+			return
+		}
+		musicDir = ""
+		songCommand = ""
+	} else if musicDir == "" && songCommand == "" {
 		http.Error(w, "Either music directory or song command is required", http.StatusBadRequest)
 		return
 	}
@@ -978,9 +1020,13 @@ func (s *Server) handleUpdateAutoDJ(w http.ResponseWriter, r *http.Request) {
 			adj.MPDPassword = mpdPassword
 			adj.Visible = visible
 			adj.SongCommand = songCommand
+			adj.Source = source
+			adj.NeteasePlaylists = neteasePlaylists
+			adj.IdleSkip = idleSkip
+			adj.AutoCachePlaylist = autoCachePlaylist
 
 			s.StreamerM.DeleteStreamer(oldMount)
-			streamer, err := s.StreamerM.StartStreamer(adj.Name, adj.Mount, absMusicDir, adj.Loop, adj.Format, adj.Bitrate, adj.InjectMetadata, adj.Playlist, adj.MPDEnabled, adj.MPDPort, adj.MPDPassword, adj.Visible, adj.LastPlaylist, adj.SongCommand, adj.SongCommandTimeout, adj.OnPlayCommand, adj.OnPlayCommandTimeout)
+			streamer, err := s.StreamerM.StartStreamer(adj)
 			if err == nil {
 				if adj.Enabled {
 					if adj.InjectMetadata {

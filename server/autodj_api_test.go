@@ -28,14 +28,11 @@ func newAutoDJTestServer(t *testing.T, djs ...*config.AutoDJConfig) *Server {
 		authAttempts: make(map[string]*authAttempt),
 		scanAttempts: make(map[string]*scanAttempt),
 	}
-	s.StreamerM = relay.NewStreamerManager(s.Relay, s.Config)
+	s.StreamerM = relay.NewStreamerManager(s.Relay, s.Config, nil)
 	s.sessions["sid"] = &session{User: admin, CSRFToken: "tok", CreatedAt: time.Now(),
 		ExpiresAt: time.Now().Add(time.Hour), LastSeen: time.Now()}
 	for _, dj := range djs {
-		if _, err := s.StreamerM.StartStreamer(dj.Name, dj.Mount, dj.MusicDir, dj.Loop,
-			dj.Format, dj.Bitrate, dj.InjectMetadata, dj.Playlist, dj.MPDEnabled, dj.MPDPort,
-			dj.MPDPassword, dj.Visible, dj.LastPlaylist, dj.SongCommand, dj.SongCommandTimeout,
-			dj.OnPlayCommand, dj.OnPlayCommandTimeout); err != nil {
+		if _, err := s.StreamerM.StartStreamer(dj); err != nil {
 			t.Fatalf("StartStreamer(%s): %v", dj.Mount, err)
 		}
 		t.Cleanup(func() { s.StreamerM.DeleteStreamer(dj.Mount) })

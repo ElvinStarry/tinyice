@@ -87,11 +87,29 @@ tinyice/
 ## 4. Key Data Flows
 
 ### A. AutoDJ Playback
-1.  `StreamerManager` selects a file from `Playlist` or `Queue`.
+1.  `StreamerManager` selects a file from `Playlist` or `Queue`. A playlist
+    entry is either a local path or `netease:<music-id>`. A cached NetEase
+    track opens directly. On a cache miss the downloader writes the HTTP body
+    to a `.part` file while the decoder follows the growing file in chunks;
+    the completed file is verified and renamed to `<music-id>.<ext>`.
 2.  File is decoded to PCM.
 3.  Transcoder (`EncodeMP3`/`EncodeOpus`) converts PCM to streaming chunks.
 4.  Chunks are written to the `Stream.Buffer`.
 5.  `Stream.Broadcast` signals all waiting Listener goroutines via channels.
+
+With `idle_skip` on and no subscribers, steps 1–4 are replaced by waiting for
+the track's duration (read from NetEase metadata or the local container
+header). The playlist advances on time; the decoder and downloader stay closed.
+A listener joining mid-track resumes at the elapsed position by decoding and
+discarding the skipped PCM once, then starting the normal encoder. During the
+last 30 seconds of a NetEase track the next entry is prefetched in the
+background, including while the mount is idle. A stream that fails mid-track
+is skipped after five seconds without decoded PCM; three consecutive stream
+failures restart the playlist from its first entry (and clear the queue).
+With `auto_cache_playlist` on, a successful playlist refresh queues newly
+added music ids for the cache and removes cached files for deleted tracks
+that no other AutoDJ, queue, current track, or prefetch references. Cache-job
+progress is persisted next to the config file.
 
 ### B. WebRTC Source (Go Live)
 1.  Browser captures microphone via `getUserMedia`.

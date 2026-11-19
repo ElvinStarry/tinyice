@@ -27,7 +27,7 @@ func TestPlayerHandlersEnforcePerMountAccess(t *testing.T) {
 		authAttempts: make(map[string]*authAttempt),
 		scanAttempts: make(map[string]*scanAttempt),
 	}
-	s.StreamerM = relay.NewStreamerManager(s.Relay, s.Config)
+	s.StreamerM = relay.NewStreamerManager(s.Relay, s.Config, nil)
 	s.sessions["sid"] = &session{User: dj, CSRFToken: "tok", CreatedAt: time.Now(),
 		ExpiresAt: time.Now().Add(time.Hour), LastSeen: time.Now()}
 

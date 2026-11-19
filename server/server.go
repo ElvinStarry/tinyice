@@ -9,13 +9,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/DatanoiseTV/tinyice/config"
 	"github.com/DatanoiseTV/tinyice/logger"
+	"github.com/DatanoiseTV/tinyice/netease"
 	"github.com/DatanoiseTV/tinyice/relay"
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
@@ -115,6 +115,14 @@ type Server struct {
 	// GeoTracker — keeps a live (country, mount) listener count
 	// updated by handleListener for the dashboard map.
 	GeoTracker *GeoTracker
+
+	// neteaseCacheJobs tracks the "cache this playlist" background jobs
+	// per mount. Progress survives tab switches; the actual downloads are
+	// serialized per music id by netease.Cache.
+	neteaseCacheMu     sync.Mutex
+	neteaseCacheJobs   map[string]*neteaseCacheJob
+	neteaseCacheQueued map[string][]int64
+	neteaseCacheLoaded bool
 }
 
 func NewServer(cfg *config.Config, authLog *zap.SugaredLogger, version, commit, setupToken string) *Server {
@@ -171,6 +179,11 @@ func NewServer(cfg *config.Config, authLog *zap.SugaredLogger, version, commit, 
 		)
 	})
 	hlsCtx, hlsCancel := context.WithCancel(context.Background())
+	ncmMusicU := ""
+	if cfg.NetEase != nil {
+		ncmMusicU = cfg.NetEase.MusicU
+	}
+	ncm := netease.NewSession(&http.Client{Timeout: 30 * time.Second}, ncmMusicU)
 	srv := &Server{
 		Config:           cfg,
 		Relay:            r,
@@ -178,7 +191,7 @@ func NewServer(cfg *config.Config, authLog *zap.SugaredLogger, version, commit, 
 		RelayM:           relay.NewRelayManager(r),
 		TranscoderM:      relay.NewTranscoderManager(r),
 		WebRTCM:          relay.NewWebRTCManager(r),
-		StreamerM:        relay.NewStreamerManager(r, cfg),
+		StreamerM:        relay.NewStreamerManager(r, cfg, ncm),
 		RTMP:             relay.NewRTMPServer(r, cfg),
 		SRT:              relay.NewSRTServer(r, cfg),
 		TenantM:          relay.NewTenantManager(),
@@ -228,6 +241,8 @@ func NewServer(cfg *config.Config, authLog *zap.SugaredLogger, version, commit, 
 			"duration_seconds": info.DurationSeconds,
 		})
 	}
+	srv.StreamerM.OnNeteasePlaylistChanged = srv.onNeteasePlaylistChanged
+	srv.resumeNeteaseCacheJobs()
 
 	return srv
 }
@@ -430,6 +445,11 @@ func (s *Server) setupRoutes() *http.ServeMux {
 	mux.HandleFunc("/api/autodj/shuffle", s.apiAutoDJShuffle)
 	mux.HandleFunc("/api/autodj/loop", s.apiAutoDJLoop)
 
+	mux.HandleFunc("/api/netease", s.handleNeteaseStatus)
+	mux.HandleFunc("/api/netease/qr", s.handleNeteaseQR)
+	mux.HandleFunc("/api/netease/logout", s.handleNeteaseLogout)
+	mux.HandleFunc("/api/netease/cache", s.handleNeteaseCache)
+
 	mux.HandleFunc("/api/autodj/playlist", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
@@ -478,6 +498,7 @@ func (s *Server) setupRoutes() *http.ServeMux {
 			"/playlist/add", "/playlist/remove", "/playlist/clear",
 			"/playlist/reorder", "/playlist/playnext",
 			"/playlist/save", "/playlist/load",
+			"/netease/cache",
 			"/files", "/playlist", "/queue",
 			"/play", "/pause", "/next", "/prev", "/previous",
 			"/shuffle", "/loop",
@@ -541,6 +562,8 @@ func (s *Server) setupRoutes() *http.ServeMux {
 			s.handlePlayerSavePlaylist(w, r)
 		case "playlist/load":
 			s.handlePlayerLoadPlaylist(w, r)
+		case "netease/cache":
+			s.handleNeteaseCachePlaylist(w, r)
 		case "queue":
 			switch r.Method {
 			case http.MethodGet:
@@ -866,6 +889,9 @@ func (s *Server) Start() error {
 	go s.hlsJanitorTask()
 	go s.HealthM.Start(context.Background())
 	go s.sessionReaperTask()
+	if ncm := s.StreamerM.Netease(); ncm != nil {
+		go ncm.Watch(s.done, netease.DefaultCheckInterval)
+	}
 	// Internal-only metrics + pprof port. See startMetricsServer for the
 	// expected firewalling.
 	s.startMetricsServer()
@@ -881,12 +907,8 @@ func (s *Server) Start() error {
 		}
 	}
 	for _, adj := range s.Config.AutoDJs {
-		absMusicDir, _ := filepath.Abs(adj.MusicDir)
-		streamer, err := s.StreamerM.StartStreamer(adj.Name, adj.Mount, absMusicDir, adj.Loop, adj.Format, adj.Bitrate, adj.InjectMetadata, adj.Playlist, adj.MPDEnabled, adj.MPDPort, adj.MPDPassword, adj.Visible, adj.LastPlaylist, adj.SongCommand, adj.SongCommandTimeout, adj.OnPlayCommand, adj.OnPlayCommandTimeout)
+		streamer, err := s.StreamerM.StartStreamer(adj)
 		if err == nil {
-			if adj.LastPlaylist != "" {
-				streamer.LoadPlaylist(adj.LastPlaylist)
-			}
 			if adj.Enabled {
 				if adj.LastPlaylist != "" {
 					streamer.LoadPlaylist(adj.LastPlaylist)
@@ -896,7 +918,7 @@ func (s *Server) Start() error {
 						st.SetVisible(adj.Visible)
 					}
 				}
-				if len(adj.Playlist) == 0 {
+				if config.NormalizeAutoDJSource(adj.Source) == config.AutoDJSourceLocal && len(adj.Playlist) == 0 {
 					streamer.ScanMusicDir()
 				}
 				streamer.Play()

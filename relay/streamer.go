@@ -3,10 +3,12 @@ package relay
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"math/rand"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,9 +20,20 @@ import (
 
 	"github.com/DatanoiseTV/tinyice/config"
 	"github.com/DatanoiseTV/tinyice/logger"
+	"github.com/DatanoiseTV/tinyice/netease"
 	"github.com/bogem/id3v2/v2"
 	"github.com/dhowden/tag"
 )
+
+const (
+	// autoDJDecodeStall is the longest the decoder may go without
+	// producing PCM. It covers format probing and mid-track corruption;
+	// the cache follower separately applies the same limit to download
+	// progress.
+	autoDJDecodeStall = 5 * time.Second
+)
+
+var errDecodeStalled = errors.New("autodj: decoder produced no valid audio for 5s")
 
 type StreamerState int
 
@@ -35,6 +48,15 @@ const (
 // "webrtc-source". Stream.SourceIP is a source descriptor, not strictly an
 // address.
 const autoDJSourceLabel = "autodj"
+
+// The encoded stream must keep one sample rate for its lifetime. Browsers
+// stop or glitch when an MP3 stream changes rate between tracks, which is
+// what happened when each file drove the shine encoder at its own rate.
+// Opus has always been pinned to 48 kHz in this codebase.
+const (
+	autoDJMP3SampleRate  = 44100
+	autoDJOpusSampleRate = 48000
+)
 
 type Streamer struct {
 	Name                 string
@@ -57,11 +79,19 @@ type Streamer struct {
 	OnPlayCommand        string
 	OnPlayCommandTimeout int
 	Volume               float64 // 0..1 playback gain applied before encode
+	Source               string  // config.AutoDJSourceLocal or config.AutoDJSourceNetease
+	NeteasePlaylists     []int64 // source-managed playlist ids
+	IdleSkip             bool    // skip decode while the mount has no listeners
+	AutoCachePlaylist    bool    // keep NetEase cache in sync with playlist changes
 
 	relay  *Relay
 	ctx    context.Context // streamer-lifetime context, parents file/command ctxs
 	cancel context.CancelFunc
 	mu     sync.RWMutex
+
+	// neteaseTracks is the metadata of the current NetEase playlist,
+	// keyed by music id. Guarded by mu.
+	neteaseTracks map[int64]netease.Track
 
 	fileCancel    context.CancelFunc
 	titleCache    map[string]string
@@ -98,6 +128,19 @@ type StreamerManager struct {
 	relay     *Relay
 	config    *config.Config
 
+	// netease serves every AutoDJ configured with that source. A nil
+	// session means the source is unavailable (tests, or the account was
+	// never set up).
+	netease  *netease.Session
+	ncmCache *netease.Cache
+
+	// prefetch holds the next NetEase track while the current one is
+	// still playing. Cached files stay on disk; with caching disabled the
+	// lease carries the temp-file cleanup and expires if unused.
+	prefetchMu  sync.Mutex
+	prefetch    map[int64]*prefetchEntry
+	prefetching map[int64]struct{}
+
 	// OnTrackStart fires once per track, after metadata is parsed and just
 	// before encoding begins. Used by the server to dispatch the
 	// `now_playing` webhook event without dragging the server package
@@ -108,6 +151,11 @@ type StreamerManager struct {
 	// up-front (typical for streaming PCM); receivers should treat 0 as
 	// "unknown" rather than "instantaneous".
 	OnTrackStart func(info TrackStartInfo)
+
+	// OnNeteasePlaylistChanged fires after a successful NetEase refresh
+	// with the music ids added and removed. The server uses it for the
+	// per-AutoDJ auto-cache option.
+	OnNeteasePlaylistChanged func(mount string, added, removed []int64)
 }
 
 // TrackStartInfo is the snapshot passed to OnTrackStart subscribers. A
@@ -123,15 +171,28 @@ type TrackStartInfo struct {
 	Format          string  // "mp3" | "opus"
 	Bitrate         int     // kbps
 	DurationSeconds float64 // 0 when unknown
+	// PositionSeconds is where playback started. Non-zero when a
+	// listener joined a track that idle-skip had already advanced.
+	PositionSeconds float64
 }
 
-func NewStreamerManager(r *Relay, cfg *config.Config) *StreamerManager {
+func NewStreamerManager(r *Relay, cfg *config.Config, session *netease.Session) *StreamerManager {
 	return &StreamerManager{
 		instances: make(map[string]*Streamer),
 		relay:     r,
 		config:    cfg,
+		netease:   session,
+		// No whole-request timeout: a streaming download may sit behind
+		// a paused AutoDJ for longer than a normal HTTP timeout. Network
+		// stalls are bounded by Cache.StallTimeout instead; cache-all and
+		// prefetch pass their own context deadlines to Acquire.
+		ncmCache: &netease.Cache{HTTP: &http.Client{}},
 	}
 }
+
+// Netease exposes the shared account session to the HTTP layer for QR
+// login and status reporting.
+func (sm *StreamerManager) Netease() *netease.Session { return sm.netease }
 
 func (s *Streamer) Play() {
 	s.mu.Lock()
@@ -397,7 +458,37 @@ func (s *Streamer) GetPlaylistInfo() []PlaylistItem {
 	return res
 }
 
+// NeteasePlaylistIDs returns the unique NetEase music ids in the current
+// playlist, in playback order. Local files, external queue entries and
+// malformed paths are skipped. Used by the "cache this playlist" action.
+func (s *Streamer) NeteasePlaylistIDs() []int64 {
+	s.mu.RLock()
+	paths := make([]string, len(s.Playlist))
+	for i, p := range s.Playlist {
+		paths[i] = p.Path
+	}
+	s.mu.RUnlock()
+
+	seen := make(map[int64]struct{}, len(paths))
+	ids := make([]int64, 0, len(paths))
+	for _, path := range paths {
+		id, ok := parseNeteasePath(path)
+		if !ok {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	return ids
+}
+
 func (s *Streamer) GetSongTitle(path string) string {
+	if t, ok := s.neteaseTrackForPath(path); ok {
+		return t.DisplayTitle()
+	}
 	s.mu.RLock()
 	if title, ok := s.titleCache[path]; ok {
 		s.mu.RUnlock()
@@ -709,6 +800,20 @@ func (s *Streamer) LoadPlaylist(filename string) error {
 		}
 	}
 
+	// A saved playlist belongs to the source that produced it. Loading a
+	// local .pls into a NetEase AutoDJ (or the reverse) would queue paths
+	// the running loop cannot resolve.
+	s.mu.RLock()
+	source := s.Source
+	s.mu.RUnlock()
+	allowed := newPlaylistPaths[:0]
+	for _, path := range newPlaylistPaths {
+		if pathAllowedForSource(path, source) {
+			allowed = append(allowed, path)
+		}
+	}
+	newPlaylistPaths = allowed
+
 	if len(newPlaylistPaths) > 0 {
 		s.mu.Lock()
 		s.Playlist = []PlaylistSong{}
@@ -1005,41 +1110,61 @@ func (s *Streamer) GetStats() StreamerStats {
 	}
 }
 
-func (sm *StreamerManager) StartStreamer(name, mount, musicDir string, loop bool, format string, bitrate int, injectMetadata bool, initialPlaylistPaths []string, mpdEnabled bool, mpdPort, mpdPassword string, visible bool, lastPlaylist string, songCommand string, songCommandTimeout int, onPlayCommand string, onPlayCommandTimeout int) (*Streamer, error) {
+func (sm *StreamerManager) StartStreamer(adj *config.AutoDJConfig) (*Streamer, error) {
+	if adj == nil {
+		return nil, fmt.Errorf("autodj configuration is nil")
+	}
+	source := config.NormalizeAutoDJSource(adj.Source)
+	if source == config.AutoDJSourceNetease && sm.netease == nil {
+		return nil, fmt.Errorf("AutoDJ %s: NetEase source selected but no NetEase session is configured", adj.Name)
+	}
+
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
+	mount := adj.Mount
 	if _, ok := sm.instances[mount]; ok {
 		return nil, fmt.Errorf("streamer for mount %s already exists", mount)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	absMusicDir, _ := filepath.Abs(musicDir)
+	musicDir := ""
+	if source == config.AutoDJSourceLocal {
+		musicDir, _ = filepath.Abs(adj.MusicDir)
+	}
 
-	initialPlaylist := make([]PlaylistSong, 0, len(initialPlaylistPaths))
+	initialPlaylist := make([]PlaylistSong, 0, len(adj.Playlist))
 	nextID := 1
-	for _, path := range initialPlaylistPaths {
+	for _, path := range adj.Playlist {
+		if !pathAllowedForSource(path, source) {
+			continue
+		}
 		initialPlaylist = append(initialPlaylist, PlaylistSong{Path: path, ID: nextID})
 		nextID++
 	}
 
 	s := &Streamer{
-		Name:                 name,
+		Name:                 adj.Name,
 		OutputMount:          mount,
-		MusicDir:             absMusicDir,
-		Format:               format,
-		Bitrate:              bitrate,
+		MusicDir:             musicDir,
+		Format:               config.NormalizeAutoDJFormat(adj.Format),
+		Bitrate:              adj.Bitrate,
 		Playlist:             initialPlaylist,
 		State:                StateStopped,
-		Loop:                 loop,
-		InjectMetadata:       injectMetadata,
-		Visible:              visible,
-		MPDPassword:          mpdPassword,
-		LastPlaylist:         lastPlaylist,
-		SongCommand:          songCommand,
-		SongCommandTimeout:   songCommandTimeout,
-		OnPlayCommand:        onPlayCommand,
-		OnPlayCommandTimeout: onPlayCommandTimeout,
+		Loop:                 adj.Loop,
+		InjectMetadata:       adj.InjectMetadata,
+		Visible:              adj.Visible,
+		MPDPassword:          adj.MPDPassword,
+		LastPlaylist:         adj.LastPlaylist,
+		SongCommand:          adj.SongCommand,
+		SongCommandTimeout:   adj.SongCommandTimeout,
+		OnPlayCommand:        adj.OnPlayCommand,
+		OnPlayCommandTimeout: adj.OnPlayCommandTimeout,
+		Source:               source,
+		NeteasePlaylists:     append([]int64(nil), adj.NeteasePlaylists...),
+		IdleSkip:             adj.IdleSkip,
+		AutoCachePlaylist:    adj.AutoCachePlaylist,
+		neteaseTracks:        make(map[int64]netease.Track),
 		relay:                sm.relay,
 		ctx:                  ctx,
 		cancel:               cancel,
@@ -1052,37 +1177,40 @@ func (sm *StreamerManager) StartStreamer(name, mount, musicDir string, loop bool
 		stateCh:              make(chan struct{}, 1),
 	}
 
-	if mpdEnabled && mpdPort != "" {
-		logger.L.Debugf("AutoDJ %s: MPD enabled on port %s", name, mpdPort)
+	if adj.MPDEnabled && adj.MPDPort != "" {
+		logger.L.Debugf("AutoDJ %s: MPD enabled on port %s", adj.Name, adj.MPDPort)
 		// Check for port conflicts within our own instances
 		for _, inst := range sm.instances {
 			inst.mu.RLock()
-			if inst.MPDServer != nil && inst.MPDServer.Port == mpdPort {
+			if inst.MPDServer != nil && inst.MPDServer.Port == adj.MPDPort {
 				inst.mu.RUnlock()
-				logger.L.Warnf("AutoDJ %s: MPD port %s is already in use by %s", name, mpdPort, inst.Name)
-				return nil, fmt.Errorf("MPD port %s is already in use by AutoDJ %s", mpdPort, inst.Name)
+				logger.L.Warnf("AutoDJ %s: MPD port %s is already in use by %s", adj.Name, adj.MPDPort, inst.Name)
+				return nil, fmt.Errorf("MPD port %s is already in use by AutoDJ %s", adj.MPDPort, inst.Name)
 			}
 			inst.mu.RUnlock()
 		}
 
-		s.MPDServer = NewMPDServer(mpdPort, mpdPassword, s)
+		s.MPDServer = NewMPDServer(adj.MPDPort, adj.MPDPassword, s)
 		if err := s.MPDServer.Start(); err != nil {
-			logger.L.Errorf("Failed to start MPD server for AutoDJ %s: %v", name, err)
+			logger.L.Errorf("Failed to start MPD server for AutoDJ %s: %v", adj.Name, err)
 		} else {
-			logger.L.Infof("MPD Server for %s listening on port %s", name, mpdPort)
+			logger.L.Infof("MPD Server for %s listening on port %s", adj.Name, adj.MPDPort)
 		}
 	} else {
-		logger.L.Debugf("AutoDJ %s: MPD not enabled or no port specified (enabled=%v, port=%s)", name, mpdEnabled, mpdPort)
+		logger.L.Debugf("AutoDJ %s: MPD not enabled or no port specified (enabled=%v, port=%s)", adj.Name, adj.MPDEnabled, adj.MPDPort)
 	}
 
 	sm.instances[mount] = s
 
-	if lastPlaylist != "" {
-		s.LoadPlaylist(lastPlaylist)
+	if adj.LastPlaylist != "" {
+		s.LoadPlaylist(adj.LastPlaylist)
 	} else {
 		s.LoadPlaylist("")
 	}
 
+	if source == config.AutoDJSourceNetease {
+		go sm.runNeteaseRefresher(ctx, s)
+	}
 	go sm.runStreamerLoop(ctx, s)
 	return s, nil
 }
@@ -1200,6 +1328,11 @@ func (sm *StreamerManager) runStreamerLoop(ctx context.Context, s *Streamer) {
 	// Counts files rejected by validateAudioFile since the last one that
 	// played. Drives the backoff below; see the comment there.
 	consecutiveInvalid := 0
+	// Counts streamFile failures since the last successful track. Three in
+	// a row means the source is unusable right now; restart the playlist
+	// from its first entry instead of walking the whole list forever.
+	consecutiveStreamFailures := 0
+	restartFromStart := false
 
 	for {
 		select {
@@ -1232,13 +1365,22 @@ func (sm *StreamerManager) runStreamerLoop(ctx context.Context, s *Streamer) {
 			var fileID int
 
 			var filePos int
-			// 1. Check Queue first
-			if len(s.Queue) > 0 {
+			// 0. After three consecutive stream failures, force the first
+			// playlist entry. Clear the queue so a queued track does not
+			// delay the requested restart.
+			if restartFromStart && len(s.Playlist) > 0 {
+				restartFromStart = false
+				s.Queue = nil
+				s.CurrentPos = 1
+				filePath = s.Playlist[0].Path
+				fileID = s.Playlist[0].ID
+				filePos = 0
+			} else if len(s.Queue) > 0 {
 				filePath = s.Queue[0]
 				s.Queue = s.Queue[1:]
 				fileID = -1 // Queue items don't have an ID from the playlist
 				filePos = -1
-			} else if s.SongCommand != "" {
+			} else if s.SongCommand != "" && s.Source != config.AutoDJSourceNetease {
 				// 2. External song command (unlock during exec to avoid blocking)
 				s.mu.Unlock()
 				if path, err := s.execSongCommand(); err == nil {
@@ -1300,8 +1442,24 @@ func (sm *StreamerManager) runStreamerLoop(ctx context.Context, s *Streamer) {
 				continue
 			}
 
-			if err := validateAudioFile(filePath); err != nil {
-				logger.L.Warnf("Streamer %s: Skipping invalid file %s: %v", s.Name, filePath, err)
+			var valid bool
+			var invalidReason error
+			_, isNCM := parseNeteasePath(filePath)
+			if isNCM {
+				_, valid = s.neteaseTrackForPath(filePath)
+				if !valid {
+					invalidReason = fmt.Errorf("music id is not in the current NetEase playlist")
+				}
+			} else {
+				invalidReason = validateAudioFile(filePath)
+				valid = invalidReason == nil
+			}
+			if !valid {
+				kind := "file"
+				if isNCM {
+					kind = "track"
+				}
+				logger.L.Warnf("Streamer %s: Skipping invalid %s %s: %v", s.Name, kind, filePath, invalidReason)
 				// Skipping is deliberately cheap so a handful of dead
 				// entries don't stall the playlist. But every `continue`
 				// in this loop bypasses the only sleeps it has, so a
@@ -1328,16 +1486,44 @@ func (sm *StreamerManager) runStreamerLoop(ctx context.Context, s *Streamer) {
 			}
 			consecutiveInvalid = 0
 
-			// Create a per-file context for skipping
+			// Per-file context so Next()/Stop() can interrupt both the
+			// idle wait and real playback.
 			fileCtx, fileCancel := context.WithCancel(ctx)
 			s.mu.Lock()
 			s.fileCancel = fileCancel
+			idleSkip := s.IdleSkip
 			s.mu.Unlock()
 
-			err := sm.streamFile(fileCtx, s, filePath, filePos, fileID)
+			startAt := time.Duration(0)
+			if idleSkip {
+				res := sm.idleTrack(fileCtx, s, filePath, filePos, fileID)
+				if !res.start {
+					s.mu.Lock()
+					s.fileCancel = nil
+					s.mu.Unlock()
+					fileCancel()
+					continue
+				}
+				startAt = res.offset
+			}
+
+			err := sm.streamFile(fileCtx, s, filePath, filePos, fileID, startAt)
 			if err != nil && fileCtx.Err() == nil {
 				logger.L.Errorf("Streamer %s: Failed to stream %s: %v", s.Name, filePath, err)
+				consecutiveStreamFailures++
+				if consecutiveStreamFailures >= 3 {
+					logger.L.Warnf("Streamer %s: %d consecutive stream failures; restarting playlist from the beginning",
+						s.Name, consecutiveStreamFailures)
+					consecutiveStreamFailures = 0
+					restartFromStart = true
+					s.mu.Lock()
+					s.CurrentPos = 0
+					s.Queue = nil
+					s.mu.Unlock()
+				}
 				time.Sleep(1 * time.Second)
+			} else {
+				consecutiveStreamFailures = 0
 			}
 
 			s.mu.Lock()
@@ -1392,17 +1578,93 @@ func validateAudioFile(path string) error {
 	return fmt.Errorf("unrecognized audio format (header: %x)", header[:4])
 }
 
-func (sm *StreamerManager) streamFile(ctx context.Context, s *Streamer, path string, pos, id int) error {
-	f, err := os.Open(path)
+// beginAutoDJOutput claims the mount for the AutoDJ and invalidates audio
+// left in the ring by a previous track. New subscribers must start at the
+// live edge: the buffer can hold tens of seconds of history, and replaying
+// a previous song (especially after idle pacing) is worse than waiting one
+// frame for fresh data. MP3 keeps existing listeners on their offsets;
+// Opus needs BeginSession because every track starts a new Ogg serial.
+func (sm *StreamerManager) beginAutoDJOutput(s *Streamer) (*Stream, error) {
+	output := sm.relay.GetOrCreateStream(s.OutputMount)
+	// Don't write into a mount a live encoder owns. The label used to be
+	// assigned unconditionally, which both mislabelled the source in the
+	// admin UI and let the AutoDJ interleave its bytes with the
+	// encoder's — torn frames for every listener.
+	if !output.ClaimSourceIfFree(autoDJSourceLabel) {
+		return nil, fmt.Errorf("mount %s already has a live source (%s); AutoDJ standing by",
+			s.OutputMount, output.GetSourceIP())
+	}
+	if s.Format == "opus" {
+		output.BeginSession()
+	} else {
+		output.CheckpointAtHead()
+	}
+	return output, nil
+}
+
+func (sm *StreamerManager) streamFile(ctx context.Context, s *Streamer, path string, pos, id int, startAt time.Duration) error {
+	// Invalidate the previous track's buffered audio before any download or
+	// file open. A listener that subscribes during the download must not be
+	// handed a burst of the song that ended minutes ago.
+	output, err := sm.beginAutoDJOutput(s)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	localPath := path
+	var ncm *netease.Track
+	var media io.Reader
+	var mediaFile *os.File
+	closeMedia := func() {}
+	defer func() { closeMedia() }()
+	decodeCtx, cancelDecode := context.WithCancel(ctx)
+	defer cancelDecode()
 
-	// Extract metadata
-	songTitle := filepath.Base(path)
+	if musicID, ok := parseNeteasePath(path); ok {
+		t, ok := s.neteaseTrackForPath(path)
+		if !ok {
+			return fmt.Errorf("netease: music id %d is not in the current playlist", musicID)
+		}
+		ncm = &t
+		if lease := sm.takePrefetch(musicID); lease != nil {
+			f, err := os.Open(lease.Path)
+			if err == nil {
+				localPath = lease.Path
+				mediaFile = f
+				media = f
+				closeMedia = func() {
+					_ = f.Close()
+					lease.Release()
+				}
+			} else {
+				lease.Release()
+			}
+		}
+		if media == nil {
+			stream, err := sm.openNeteaseStream(decodeCtx, musicID)
+			if err != nil {
+				return err
+			}
+			localPath = stream.Path
+			media = stream
+			closeMedia = func() { _ = stream.Close() }
+		}
+	} else {
+		f, err := os.Open(localPath)
+		if err != nil {
+			return err
+		}
+		mediaFile = f
+		media = f
+		closeMedia = func() { _ = f.Close() }
+	}
+
+	// Extract metadata. NetEase metadata comes from the API; reading the
+	// downloaded file would only repeat what the playlist already knows.
+	songTitle := filepath.Base(localPath)
 	var tagMeta tag.Metadata
-	if m, err := tag.ReadFrom(f); err == nil {
+	if ncm != nil {
+		songTitle = ncm.DisplayTitle()
+	} else if m, err := tag.ReadFrom(mediaFile); err == nil {
 		tagMeta = m
 		if m.Artist() != "" && m.Title() != "" {
 			songTitle = fmt.Sprintf("%s - %s", m.Artist(), m.Title())
@@ -1410,12 +1672,53 @@ func (sm *StreamerManager) streamFile(ctx context.Context, s *Streamer, path str
 			songTitle = m.Title()
 		}
 	}
-	// Seek back to start after reading tags
-	f.Seek(0, 0)
+	if mediaFile != nil {
+		// Seek back to start after reading tags.
+		_, _ = mediaFile.Seek(0, 0)
+	}
 
-	decoder, err := OpenDecoder(f)
+	watchdog := newDecodeWatchdog(s, autoDJDecodeStall, func() {
+		cancelDecode()
+		if mediaFile != nil {
+			_ = mediaFile.Close()
+		}
+	})
+	defer watchdog.Stop()
+
+	decoder, err := OpenDecoder(media)
 	if err != nil {
+		if watchdog.TimedOut() {
+			return errDecodeStalled
+		}
 		return err
+	}
+	watchdog.Progress()
+
+	duration := time.Duration(0)
+	if ncm != nil {
+		duration = ncm.Duration
+	} else if d, derr := estimateAudioDuration(localPath); derr == nil {
+		duration = d
+	}
+	if startAt < 0 {
+		startAt = 0
+	}
+	if duration > 0 && startAt >= duration {
+		// A listener joined after the track's last sample. Treat the
+		// track as consumed instead of starting an empty encoder.
+		return nil
+	}
+	if startAt > 0 {
+		logger.L.Debugw("AutoDJ resuming track at elapsed position",
+			"mount", s.OutputMount, "path", path, "offset", startAt)
+		frames := int64(startAt.Seconds() * float64(decoder.SampleRate()))
+		progress := &progressReader{r: decoder, progress: watchdog.Progress}
+		if err := discardDecodedPCM(ctx, progress, frames*4); err != nil {
+			if watchdog.TimedOut() {
+				return errDecodeStalled
+			}
+			return err
+		}
 	}
 
 	s.mu.Lock()
@@ -1426,7 +1729,14 @@ func (sm *StreamerManager) streamFile(ctx context.Context, s *Streamer, path str
 	s.CurrentFilePath = path
 	s.CurrentPlayingPos = pos
 	s.CurrentPlayingID = id
-	if tagMeta != nil {
+	if ncm != nil {
+		s.CurrentArtist = joinArtists(ncm.Artists)
+		s.CurrentTitle = ncm.Name
+		s.CurrentAlbum = ncm.Album
+		if s.CurrentTitle == "" {
+			s.CurrentTitle = songTitle
+		}
+	} else if tagMeta != nil {
 		s.CurrentArtist = tagMeta.Artist()
 		s.CurrentTitle = tagMeta.Title()
 		s.CurrentAlbum = tagMeta.Album()
@@ -1434,25 +1744,20 @@ func (sm *StreamerManager) streamFile(ctx context.Context, s *Streamer, path str
 			s.CurrentTitle = songTitle
 		}
 	}
-	s.CurrentSampleRate = decoder.SampleRate()
+	outputRate := autoDJMP3SampleRate
+	if s.Format == "opus" {
+		outputRate = autoDJOpusSampleRate
+	}
+	s.CurrentSampleRate = outputRate
 	s.CurrentChannels = 2 // decoders always emit 2 channels via OpenDecoder
-	s.CurrentFileTime = time.Now()
+	s.CurrentFileTime = time.Now().Add(-startAt)
 	s.CurrentPausedNanos.Store(0)
-	s.CurrentFileDuration = 0 // PCM length isn't known up-front for non-MP3 inputs
+	s.CurrentFileDuration = duration
 	s.mu.Unlock()
 	s.broadcastIdle("player") // new track: idle MPD clients refresh currentsong
 
 	// Update stream metadata under the output stream's mutex so concurrent
 	// Snapshot / listener reads see a coherent set of fields.
-	output := sm.relay.GetOrCreateStream(s.OutputMount)
-	// Don't write into a mount a live encoder owns. The label used to be
-	// assigned unconditionally, which both mislabelled the source in the
-	// admin UI and let the AutoDJ interleave its bytes with the
-	// encoder's — torn frames for every listener.
-	if !output.ClaimSourceIfFree(autoDJSourceLabel) {
-		return fmt.Errorf("mount %s already has a live source (%s); AutoDJ standing by",
-			s.OutputMount, output.GetSourceIP())
-	}
 	output.mu.Lock()
 	if s.InjectMetadata {
 		output.CurrentSong = s.CurrentFile
@@ -1475,8 +1780,12 @@ func (sm *StreamerManager) streamFile(ctx context.Context, s *Streamer, path str
 		sm.relay.UpdateMetadata(s.OutputMount, s.CurrentFile)
 	}
 
+	if ncm != nil {
+		sm.scheduleNeteasePrefetch(s, path)
+	}
+
 	// Fire on_play_command hook (runs in background, non-blocking).
-	s.execOnPlayCommand(s.CurrentArtist, s.CurrentTitle, s.CurrentAlbum, path, s.OutputMount)
+	s.execOnPlayCommand(s.CurrentArtist, s.CurrentTitle, s.CurrentAlbum, localPath, s.OutputMount)
 
 	// Notify the server so it can dispatch webhook subscribers. Run in a
 	// goroutine: the server callback may block briefly on JSON marshal /
@@ -1491,10 +1800,11 @@ func (sm *StreamerManager) streamFile(ctx context.Context, s *Streamer, path str
 			Artist:          s.CurrentArtist,
 			Title:           s.CurrentTitle,
 			Album:           s.CurrentAlbum,
-			FilePath:        path,
+			FilePath:        localPath,
 			Format:          s.Format,
 			Bitrate:         s.Bitrate,
 			DurationSeconds: s.CurrentFileDuration.Seconds(),
+			PositionSeconds: startAt.Seconds(),
 		}
 		go func() {
 			defer func() {
@@ -1508,13 +1818,166 @@ func (sm *StreamerManager) streamFile(ctx context.Context, s *Streamer, path str
 	}
 
 	pcm := s.buildPCMChain(ctx, decoder, decoder.SampleRate())
+	tracked := &trackingReader{r: pcm, watchdog: watchdog}
 
 	if s.Format == "opus" {
-		EncodeOpus(ctx, sm.relay, output, pcm, s.Bitrate, &s.BytesStreamed, true)
+		EncodeOpus(ctx, sm.relay, output, tracked, s.Bitrate, &s.BytesStreamed, true)
 	} else {
-		EncodeMP3(ctx, sm.relay, output, pcm, s.Bitrate, &s.BytesStreamed, true, decoder.SampleRate())
+		EncodeMP3(ctx, sm.relay, output, tracked, s.Bitrate, &s.BytesStreamed, true, autoDJMP3SampleRate)
 	}
+	// EncodeMP3/EncodeOpus stop silently when the decoder fails. A cache
+	// stream that stalls or loses the network must surface as a track
+	// failure so the AutoDJ can skip and count it.
+	if watchdog.TimedOut() {
+		return errDecodeStalled
+	}
+	if tracked.err != nil {
+		return tracked.err
+	}
+	return nil
+}
 
+// decodeWatchdog cancels the current track when the decoder produces no
+// PCM for autoDJDecodeStall. A paused stream is exempt; on resume the
+// five-second window starts again.
+type decodeWatchdog struct {
+	s       *Streamer
+	timeout time.Duration
+	cancel  func()
+	last    atomic.Int64
+	timed   atomic.Bool
+	stop    chan struct{}
+	once    sync.Once
+}
+
+func newDecodeWatchdog(s *Streamer, timeout time.Duration, cancel func()) *decodeWatchdog {
+	w := &decodeWatchdog{
+		s:       s,
+		timeout: timeout,
+		cancel:  cancel,
+		stop:    make(chan struct{}),
+	}
+	w.last.Store(time.Now().UnixNano())
+	go w.run()
+	return w
+}
+
+func (w *decodeWatchdog) Progress() {
+	w.last.Store(time.Now().UnixNano())
+}
+
+func (w *decodeWatchdog) TimedOut() bool { return w.timed.Load() }
+
+func (w *decodeWatchdog) Stop() {
+	w.once.Do(func() { close(w.stop) })
+}
+
+func (w *decodeWatchdog) run() {
+	interval := w.timeout / 20
+	if interval < 50*time.Millisecond {
+		interval = 50 * time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-w.stop:
+			return
+		case now := <-ticker.C:
+			if w.s != nil && w.s.isPaused() {
+				w.last.Store(now.UnixNano())
+				continue
+			}
+			if now.Sub(time.Unix(0, w.last.Load())) < w.timeout {
+				continue
+			}
+			if w.timed.CompareAndSwap(false, true) && w.cancel != nil {
+				w.cancel()
+			}
+			return
+		}
+	}
+}
+
+func (s *Streamer) isPaused() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.State == StatePaused
+}
+
+// progressReader feeds the watchdog during the decode-and-discard seek
+// used when a listener joins an idle track.
+type progressReader struct {
+	r        io.Reader
+	progress func()
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if n > 0 && p.progress != nil {
+		p.progress()
+	}
+	return n, err
+}
+
+// trackingReader records the first non-EOF decoder error so an encoder
+// that simply returns on read failure does not hide a dead network stream.
+type trackingReader struct {
+	r        io.Reader
+	watchdog *decodeWatchdog
+	err      error
+}
+
+func (t *trackingReader) Read(p []byte) (int, error) {
+	n, err := t.r.Read(p)
+	if n > 0 && t.watchdog != nil {
+		t.watchdog.Progress()
+	}
+	if err != nil && err != io.EOF && t.err == nil {
+		t.err = err
+	}
+	return n, err
+}
+
+// PausedTotal forwards the pause accounting so wrapping the PCM chain does
+// not hide it from activeElapsed. Without this, resuming a paused AutoDJ
+// made the encoder believe it was behind schedule and dump the remainder of
+// the track as fast as possible.
+func (t *trackingReader) PausedTotal() time.Duration {
+	if pa, ok := t.r.(pauseAware); ok {
+		return pa.PausedTotal()
+	}
+	return 0
+}
+
+// discardDecodedPCM advances a decoder to a mid-track position by
+// decoding and throwing the samples away. Not every container decoder can
+// seek, and correctness matters more than the one-off CPU cost of a
+// listener joining an idle track.
+func discardDecodedPCM(ctx context.Context, r io.Reader, n int64) error {
+	if n <= 0 {
+		return nil
+	}
+	buf := make([]byte, 64*1024)
+	for n > 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		chunk := int64(len(buf))
+		if chunk > n {
+			chunk = n
+		}
+		read, err := io.ReadFull(r, buf[:chunk])
+		n -= int64(read)
+		if err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				return nil
+			}
+			return err
+		}
+	}
 	return nil
 }
 
@@ -1533,10 +1996,16 @@ func (s *Streamer) buildPCMChain(ctx context.Context, decoded io.Reader, srcRate
 	if gain := s.GetVolume(); gain < 1.0 {
 		pcm = newGainReader(pcm, gain)
 	}
-	if s.Format == "opus" && srcRate != 48000 {
-		// The Opus encoder is locked at 48 kHz; resample so playback
-		// isn't sped up / slowed down.
-		pcm = NewLinearResampler(pcm, srcRate, 48000)
+	if s.Format == "opus" {
+		if srcRate != autoDJOpusSampleRate {
+			// The Opus encoder is locked at 48 kHz; resample so playback
+			// isn't sped up / slowed down.
+			pcm = NewLinearResampler(pcm, srcRate, autoDJOpusSampleRate)
+		}
+	} else if srcRate != autoDJMP3SampleRate {
+		// Keep the Icecast MP3 stream at one rate across every track.
+		// Changing rate mid-stream makes browser decoders stall.
+		pcm = NewLinearResampler(pcm, srcRate, autoDJMP3SampleRate)
 	}
 	return newPauseGate(ctx, s, pcm)
 }
